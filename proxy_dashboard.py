@@ -384,6 +384,66 @@ def status():
     }
 
 
+REAL_IP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "real_ip.txt")
+IP_RE = re.compile(r"^[0-9a-fA-F:.]{3,45}$")
+VPN_RE = re.compile(r"\b(vpn|wintun|wireguard|openvpn|tap-windows|nordlynx|proton|mullvad|surfshark|"
+                    r"expressvpn|windscribe|cyberghost|anyconnect|fortinet|globalprotect|zerotier|tailscale)\b"
+                    r"|\bTAP\b", re.I)
+
+
+def saved_real_ip():
+    try:
+        with open(REAL_IP_FILE, encoding="ascii") as f:
+            v = f.read().strip()
+        return v if IP_RE.match(v) else ""
+    except OSError:
+        return ""
+
+
+def local_ips():
+    ips = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    try:
+        t = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        t.connect(("10.255.255.255", 1))      # UDP "connect": no packet is sent
+        ips.add(t.getsockname()[0])
+        t.close()
+    except OSError:
+        pass
+    return sorted(i for i in ips if not i.startswith("127."))
+
+
+def vpn_adapters():
+    cmd = ("Get-NetAdapter | Where-Object Status -eq 'Up' | "
+           "ForEach-Object { $_.Name + ' | ' + $_.InterfaceDescription }")
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
+                           capture_output=True, text=True, timeout=15,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        names = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+        return {"checked": r.returncode == 0, "found": [n for n in names if VPN_RE.search(n)]}
+    except Exception:
+        return {"checked": False, "found": []}
+
+
+def ident():
+    return {"public": curl_ip([]), "real": saved_real_ip(),
+            "local": local_ips(), "vpn": vpn_adapters()}
+
+
+def save_real_ip():
+    r = curl_ip([])
+    if not r["ok"]:
+        raise ValueError("Could not read your public IP (are you online?)")
+    with open(REAL_IP_FILE, "w", encoding="ascii") as f:
+        f.write(r["ip"])
+    return f"Saved {r['ip']} as your real IP"
+
+
 def ps_snippets(s):
     sp, hp = s["socks_port"], s["http_port"]
     cred = f"{s['user']}:{s['password']}"
@@ -426,6 +486,8 @@ class H(BaseHTTPRequestHandler):
             return self._json(status())
         if self.path == "/api/ips":
             return self._json(check_ips())
+        if self.path == "/api/ident":
+            return self._json(ident())
         self._json({"error": "not found"}, 404)
 
     def do_POST(self):
@@ -442,6 +504,8 @@ class H(BaseHTTPRequestHandler):
                     json.dump(s, f, indent=2)
                 note = " Restart the proxy to apply." if ENGINE.running() else " Click Start to run it."
                 return self._json({"message": "Settings saved." + note})
+            if self.path == "/api/saveip":
+                return self._json({"message": save_real_ip()})
             if self.path == "/api/start":
                 return self._json({"message": ENGINE.start(load_settings())})
             if self.path == "/api/stop":
@@ -484,6 +548,17 @@ pre{background:#080c11;border:1px solid var(--line);border-radius:8px;padding:12
 <div class="row" style="margin-left:auto"><button onclick="act('start')">Start</button><button onclick="act('stop')">Stop</button><button onclick="act('restart')">Restart</button></div></header>
 <main>
 <div id="msg" class="mono"></div>
+<section><h2>My IP &amp; VPN View</h2>
+<div class="grid">
+<div class="card"><div class="note">Your real IP (saved)</div><div id="i_real" class="big mono">—</div><button onclick="saveReal()">Save current IP as my real IP</button><div class="note">Click this with your VPN turned OFF.</div></div>
+<div class="card"><div class="note">Seen by VPN apps &amp; websites now (normal connection)</div><div id="i_pub" class="big mono">—</div></div>
+<div class="card"><div class="note">If an app uses this proxy, it sees</div><div id="i_proxy" class="big mono">—</div><div class="note">Updates when you click Check IPs now.</div></div>
+<div class="card"><div class="note">VPN status</div><span id="i_vpn" class="badge dim">…</span><div id="i_vpnn" class="note mono"></div><div class="note">Local (LAN) IP: <span id="i_local" class="mono">—</span></div></div>
+</div>
+<p id="i_verdict" class="note"></p>
+<div class="row"><button onclick="ident()">Refresh</button></div>
+</section>
+
 <section><h2>Middleman Status</h2>
 <div class="grid">
 <div class="card"><div class="note">Direct IP</div><div id="ip_direct" class="big mono">—</div><span id="b_direct" class="badge dim">unchecked</span></div>
@@ -527,6 +602,19 @@ function preview(){clearTimeout(T);T=setTimeout(async()=>{try{show(await api('/a
 async function save(){try{msg((await api('/api/save',form())).message)}catch(e){msg(e.message,1)}}
 async function act(a){try{msg((await api('/api/'+a,{})).message);setTimeout(refresh,500)}catch(e){msg(e.message,1)}}
 function copy(id){navigator.clipboard.writeText($(id).textContent);msg('Copied')}
+async function ident(){$('i_pub').textContent='…';
+ try{const d=await api('/api/ident');const pub=d.public.ok?d.public.ip:null;
+  $('i_pub').textContent=pub||'—';$('i_real').textContent=d.real||'not saved';
+  $('i_local').textContent=d.local.join(', ')||'—';const v=d.vpn;
+  badge($('i_vpn'),!v.checked?'unknown':(v.found.length?'VPN adapter active':'No VPN adapter'),!v.checked?'dim':(v.found.length?'warn':'ok'));
+  $('i_vpnn').textContent=v.found.join(' · ');
+  let t;
+  if(!pub)t='Could not read your public IP (are you online?).';
+  else if(!d.real)t='Click "Save current IP as my real IP" (with VPN off) so I can compare.';
+  else if(pub===d.real)t='A VPN app or website checking your IP right now sees your REAL IP: '+pub;
+  else t='A VPN app or website checking your IP right now sees '+pub+', not your real IP ('+d.real+'). A VPN is likely masking it (or your ISP changed your IP).';
+  $('i_verdict').textContent=t}catch(e){msg(e.message,1)}}
+async function saveReal(){try{msg((await api('/api/saveip',{})).message);ident()}catch(e){msg(e.message,1)}}
 async function refresh(){try{const s=await api('/api/status');
  badge($('proc'),s.process?'proxy running':'proxy stopped',s.process?'ok':'bad');
  $('sp').textContent=':'+s.socks.port;$('hp').textContent=':'+s.http.port;
@@ -536,10 +624,10 @@ async function refresh(){try{const s=await api('/api/status');
 async function check(){['direct','socks','http'].forEach(k=>{$('ip_'+k).textContent='…';badge($('b_'+k),'checking','dim')});
  try{const r=await api('/api/ips');for(const k of ['direct','socks','http']){const v=r[k];
   $('ip_'+k).textContent=v.ok?v.ip:'—';badge($('b_'+k),v.ok?'OK':'Error',v.ok?'ok':'bad');if(!v.ok)$('ip_'+k).title=v.error}
-  const d=r.direct,s=r.socks,h=r.http;
+  const d=r.direct,s=r.socks,h=r.http;$('i_proxy').textContent=s.ok?s.ip:'—';
   $('cmp').textContent=!d.ok?'Direct check failed.':[s.ok&&(s.ip!==d.ip?'SOCKS exit differs from direct':'SOCKS exit equals direct'),h.ok&&(h.ip!==d.ip?'HTTP exit differs from direct':'HTTP exit equals direct')].filter(Boolean).join(' · ')||'Proxy ports unreachable (click Start first; check credentials)';
  }catch(e){msg(e.message,1)}}
-(async()=>{try{const d=await api('/api/settings');fill(d.settings);show(d)}catch(e){msg(e.message,1)}refresh();setInterval(refresh,5000)})();
+(async()=>{try{const d=await api('/api/settings');fill(d.settings);show(d)}catch(e){msg(e.message,1)}refresh();ident();setInterval(refresh,5000)})();
 </script></body></html>"""
 
 if __name__ == "__main__":
